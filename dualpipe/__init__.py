@@ -1,5 +1,7 @@
 __version__ = "1.0.0"
 
+## Exposes the public API (DualPipe, WeightGradStore, and communication setters).
+
 from dualpipe.dualpipe import (
     DualPipe,
     WeightGradStore,
