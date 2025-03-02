@@ -6,22 +6,33 @@ from torch.autograd import Variable
 
 
 class WeightGradStore:
-
+    '''
+    Manages gradient computation and weight updates for zero-bubble optimization.
+    '''
     enabled: bool = False
     cache: List[Callable] = []
     funcs_queue = queue.Queue()
 
     @classmethod
     def put(cls, func: Callable) -> None:
+        '''
+        Queues a gradient computation function.
+        '''
         cls.cache.append(func)
 
     @classmethod
     def flush(cls) -> None:
+        '''
+        Transfers cached functions to a queue.
+        '''
         cls.funcs_queue.put(cls.cache)
         cls.cache = []
 
     @classmethod
     def pop(cls) -> None:
+        '''
+        Executes queued gradient updates.
+        '''
         assert not cls.funcs_queue.empty(), "Pop empty queue."
         funcs = cls.funcs_queue.get()
         for func in funcs:
@@ -29,11 +40,17 @@ class WeightGradStore:
 
     @classmethod
     def clear(cls) -> None:
+        '''
+        Resets state.
+        '''
         cls.cache = []
         cls.funcs_queue = queue.Queue()
 
 
 def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) -> None:
+    '''
+    Executes backward pass with given tensors and gradients.
+    '''
     kwargs = dict(
         keep_graph=False,
         create_graph=False,
@@ -42,12 +59,10 @@ def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) 
     )
     Variable._execution_engine.run_backward(tensors, grad_tensors, **kwargs)
 
-
 def chunk_tensor(x, chunks, dim):
     if x is None:
         return [None for _ in range(chunks)]
     return x.tensor_split(chunks, dim=dim)
-
 
 def cat_tensor(x, dim):
     if (isinstance(x, tuple) or isinstance(x, list)):
@@ -60,6 +75,9 @@ def cat_tensor(x, dim):
 
 
 def scatter(inputs, chunks, dim):
+    '''
+    Splits inputs into micro-batches along a dimension.
+    '''
     assert isinstance(inputs, (torch.Tensor, tuple, list))
     if isinstance(inputs, torch.Tensor):
         inputs = (inputs,)
@@ -72,6 +90,9 @@ def scatter(inputs, chunks, dim):
 
 
 def gather(micro_outputs, dim):
+    '''
+    Combines micro-batch outputs into a single tensor
+    '''
     assert isinstance(micro_outputs[0], (torch.Tensor, tuple, list))
     if isinstance(micro_outputs[0], torch.Tensor):
         micro_outputs = [(x,) for x in micro_outputs]
