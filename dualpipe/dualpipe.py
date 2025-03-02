@@ -16,15 +16,33 @@ class DualPipe(nn.Module):
         process_group: Optional[dist.ProcessGroup] = None,
         rank_mapping: Optional[List[int]] = None,
     ) -> None:
+        '''
+        Purpose: Sets up the pipeline with two modules and configures distributed communication.
+        
+        Parameters:
+            - modules: A tuple of two nn.Module instances, one for each direction.
+            - batch_dim: Dimension along which to split batches (default: 0).
+            - process_group: PyTorch distributed process group (defaults to the global group).
+            - rank_mapping: Maps process group ranks to pipeline ranks (defaults to sequential mapping).
+        
+        Key Logic:
+            - Verifies that modules are on the current GPU.
+            - Checks if modules support overlapped forward-backward computation via overlapped_forward_backward.
+            - Determines the rank’s position (first, last, middle, or second half) in the pipeline for directional logic.
+        '''
         super().__init__()
 
+        ## Verifies that modules are on the current GPU.
         assert next(modules[0].parameters()).device == torch.device(torch.cuda.current_device())
+
+        ## Checks if modules support overlapped forward-backward computation via overlapped_forward_backward.
         self.module = nn.ModuleList(modules)
         self.overlapped_forward_backward = type(modules[0]) == type(modules[1]) and hasattr(type(modules[0]), "overlapped_forward_backward")
         self.batch_dim = batch_dim
         self.group = process_group or dist.distributed_c10d._get_default_group()
         self.num_ranks = self.group.size()
 
+        ## Determines the rank’s position (first, last, middle, or second half) in the pipeline for directional logic.
         # rank_mapping: Map rank in process_group to actual pp rank.
         # rank_inverse_mapping: Map actual pp rank to rank in process_group.
         if rank_mapping is None:
@@ -45,6 +63,15 @@ class DualPipe(nn.Module):
         self.is_middle_rank = (self.rank == self.num_ranks // 2 - 1) or (self.rank == self.num_ranks // 2)
 
     def _reset_states(self) -> None:
+        '''
+        Purpose: Initializes or resets internal buffers for each step.
+
+        Key Variables:
+            - input_chunks, output_chunks, input_grad_chunks, output_grad_chunks: Buffers for inputs, outputs, and gradients in both phases (0 and 1).
+            - labels, loss_chunks, criterion: For loss computation at endpoint ranks.
+            - current_f_chunk_id, current_b_chunk_id: Track micro-batch indices for forward and backward passes.
+            - comm_ops, to_free: Manage communication operations and tensor cleanup.
+        '''
         WeightGradStore.clear()
 
         self.input_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
@@ -65,6 +92,17 @@ class DualPipe(nn.Module):
         self.to_free: List[torch.Tensor] = []
 
     def _forward_compute_chunk(self, phase: int) -> None:
+        '''
+        Forward Computation
+        
+        Purpose: Executes a forward pass for a micro-batch in a given phase (0 or 1).
+        
+        Logic:
+            - Flips phase based on rank’s position (first or second half).
+            - Processes inputs through the module, computes loss if at the last stage and a criterion is provided.
+            - Stores outputs unless it’s the last stage and outputs aren’t needed.
+        '''
+        ## Flips phase based on rank’s position (first or second half).
         phase ^= self.is_in_second_half
         chunk_id = self.current_f_chunk_id[phase]
         self.current_f_chunk_id[phase] += 1
@@ -74,7 +112,10 @@ class DualPipe(nn.Module):
 
         is_last_stage = (self.is_first_rank and phase == 1) or (self.is_last_rank and phase == 0)
 
+        ## Processes inputs through the module, computes loss if at the last stage and a criterion is provided.
         outputs = self.module[phase](*inputs)
+
+        ## Stores outputs unless it’s the last stage and outputs aren’t needed.
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage and self.criterion is not None:
             labels = self.labels[phase][chunk_id]
@@ -85,6 +126,18 @@ class DualPipe(nn.Module):
             self.output_chunks[phase].append(outputs)
 
     def _backward_compute_chunk(self, phase: int, enable_zb: bool = False) -> None:
+        '''
+        Backward Computation
+        
+        Purpose: Executes a backward pass for a micro-batch.
+        
+        Logic:
+            - Skips if in forward-only mode.
+            - Uses WeightGradStore for zero-bubble optimization when enabled.
+            - At the last stage, computes gradients from loss; otherwise, backpropagates gradients from output_grads.
+            - Stores input gradients for communication.
+        '''
+        ## Skips if in forward-only mode.
         if self.forward_only:
             return
 
@@ -94,12 +147,16 @@ class DualPipe(nn.Module):
 
         is_last_stage = (self.is_first_rank and phase == 1) or (self.is_last_rank and phase == 0)
 
+        ## Uses WeightGradStore for zero-bubble optimization when enabled.
         WeightGradStore.enabled = enable_zb
+
         if is_last_stage:
+            ## At the last stage, computes gradients from loss;
             loss = self.loss_chunks[chunk_id]
             loss.backward()
             loss.detach_()
         else:
+            ## otherwise, backpropagates gradients from output_grads.
             outputs = self.output_chunks[phase][chunk_id]
             if not self.return_outputs:
                 self.output_chunks[phase][chunk_id] = None
@@ -113,12 +170,23 @@ class DualPipe(nn.Module):
         if enable_zb:
             WeightGradStore.flush()
 
+        ## Stores input gradients for communication.
         inputs = self.input_chunks[phase][chunk_id]
         self.input_chunks[phase][chunk_id] = None
         input_grads = [t.grad for t in inputs]
         self.input_grad_chunks[phase].append(input_grads)
 
     def _forward_backward_compute_chunk(self, phase0: int, phase1: int) -> None:
+        '''
+        Overlapped Forward-Backward
+        Purpose: Overlaps forward and backward computations when supported by the modules.
+        
+        Logic:
+            - Prepares inputs and outputs for both phases.
+            - Calls the module’s overlapped_forward_backward method to compute both simultaneously.
+            - Handles post-processing (storing outputs, gradients, and losses).
+        '''
+        ## Prepares inputs and outputs for both phases.
         if self.forward_only:
             self._forward_compute_chunk(phase0)
             return
@@ -164,12 +232,14 @@ class DualPipe(nn.Module):
             non_empty = [(t, g) for t, g in zip(outputs1, output_grads1) if g is not None]
             outputs1, output_grads1 = list(zip(*non_empty))
 
+        ## Calls the module’s overlapped_forward_backward method to compute both simultaneously.
         # forward & backward
         outputs0, loss0 = type(module0).overlapped_forward_backward(
             module0, inputs0, criterion0, labels0,
             module1, loss1, outputs1, output_grads1,
         )
 
+        ## Handles post-processing (storing outputs, gradients, and losses).
         # post-forward
         if (not is_last_stage0) or self.return_outputs:
             self.output_chunks[phase0].append(outputs0)
@@ -182,6 +252,16 @@ class DualPipe(nn.Module):
         input_grads1 = [t.grad for t in inputs]
         self.input_grad_chunks[phase1].append(input_grads1)
 
+    '''
+    Pipeline Steps
+    Purpose: Wrap computation and communication for specific pipeline stages.
+    
+    Logic:
+        - _forward_chunk: Receives inputs, computes forward, sends outputs.
+        - _backward_chunk: Receives gradients, computes backward, sends input gradients, optionally with zero-bubble optimization.
+        - _forward_backward_chunk: Overlaps forward and backward for two phases with communication.
+        - _weight_chunk: Applies gradient updates using WeightGradStore.
+    '''
     def _forward_chunk(self, phase: int, recv: bool = True, send: bool = True) -> None:
         if recv:
             self._recv_forward(phase)
@@ -227,7 +307,13 @@ class DualPipe(nn.Module):
             assert tensor._base is None, f"pipeline stage should not return view tensors {dist.get_rank(), tensor.shape}"
             tensor.data = torch.Tensor()
         self.to_free = []
-
+        
+    '''
+    Communication Helpers:
+        - _recv_forward, _send_forward: Receive and send forward pass tensors between ranks.
+        - _recv_backward, _send_backward: Handle backward pass gradient communication.
+        - _commit_and_wait_comm: Executes queued communication operations (send/receive) and frees tensors.
+    '''
     def _recv_forward(self, phase: int) -> None:
         phase ^= self.is_in_second_half
         is_first_stage = (self.is_first_rank and phase == 0) or (self.is_last_rank and phase == 1)
@@ -322,6 +408,34 @@ class DualPipe(nn.Module):
                 Otherwise: ``None``.
 
         """
+
+        '''
+        Main Execution (step)
+        Purpose: Orchestrates the entire training or inference step across micro-batches.
+        
+        Parameters:
+            - inputs, labels: Provided at first/last ranks.
+            - num_chunks: Number of micro-batches (must be even and ≥ 2 × num_ranks).
+            - criterion: Loss function for endpoint ranks.
+            - return_outputs: Whether to return outputs from endpoint ranks.
+        
+        Logic:
+            - Splits inputs/labels into micro-batches using scatter.
+            - Assigns inputs/labels based on rank (first rank: forward inputs, reverse labels; last rank: vice versa).
+            - Executes 8 steps based on the bidirectional schedule (detailed below).
+            - Returns loss and outputs (if requested) after gathering results.
+
+        Steps:
+            1. nF0: Forward computations for phase 0 (warm-up).
+            2. nF0F1: Alternates forward for phases 0 and 1 with communication.
+            3. nB1W1F1: Backward for phase 1, weight updates, and forward for phase 1 with zero-bubble optimization.
+            4. nF0B1F1B0: Main overlap phase for forward and backward in both directions.
+            5. nB1F1B0: Backward for phase 1 with overlapped forward-backward for phase 0.
+            6. nB1B0: Backward for both phases, with zero-bubble for the second half.
+            7. nWB0: Weight updates and backward for phase 0 with zero-bubble.
+            8. nW: Final weight updates.
+        '''
+
         assert comm.TENSOR_SHAPES is not None and comm.TENSOR_DTYPE is not None, \
             "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before doing a step."
         self.forward_only = not torch.is_grad_enabled()
@@ -356,11 +470,13 @@ class DualPipe(nn.Module):
         # For the second half of the ranks: phase 0 means reverse direction, phase 1 means forward direction.
 
         # Step 1: nF0
+        ## 1. nF0: Forward computations for phase 0 (warm-up).
         step_1 = (num_half_ranks - half_rank - 1) * 2
         for i in range(step_1):
             self._forward_chunk(0)
 
         # Step 2: nF0F1
+        ## 2. nF0F1: Alternates forward for phases 0 and 1 with communication.
         step_2 = half_rank + 1
         self._recv_forward(0)
         for i in range(step_2):
@@ -371,6 +487,7 @@ class DualPipe(nn.Module):
                 self._send_forward(0)
 
         # Step 3: nB1W1F1 (Use zero bubble)
+        ## 3. nB1W1F1: Backward for phase 1, weight updates, and forward for phase 1 with zero-bubble optimization.
         step_3 = num_half_ranks - half_rank - 1
         for i in range(step_3):
             self._backward_chunk(1, enable_zb=True)
@@ -379,6 +496,7 @@ class DualPipe(nn.Module):
             self._forward_chunk(1, recv=False)
 
         # Step 4 (Main step): nF0B1F1B0
+        ## 4. nF0B1F1B0: Main overlap phase for forward and backward in both directions.
         step_4 = half_num_chunks - num_ranks + half_rank + 1
         for i in range(step_4):
             if i == 0:
@@ -396,12 +514,14 @@ class DualPipe(nn.Module):
             self._forward_backward_chunk(1, 0)
 
         # Step 5: nB1F1B0
+        ## 5. nB1F1B0: Backward for phase 1 with overlapped forward-backward for phase 0.
         step_5 = num_half_ranks - half_rank - 1
         for i in range(step_5):
             self._backward_chunk(1)
             self._forward_backward_chunk(1, 0)
 
         # Step 6: nB1B0 (The second half of the chunks use zero bubble)
+        ## 6. nB1B0: Backward for both phases, with zero-bubble for the second half.
         step_6 = half_rank + 1
         enable_zb = False
         for i in range(step_6):
@@ -413,12 +533,14 @@ class DualPipe(nn.Module):
             self._backward_chunk(0, enable_zb=enable_zb)
 
         # Step 7: nWB0 (Use zero bubble)
+        ## 7. nWB0: Weight updates and backward for phase 0 with zero-bubble.
         step_7 = num_half_ranks - half_rank - 1
         for i in range(step_7):
             self._weight_chunk()
             self._backward_chunk(0, enable_zb=True)
 
         # Step 8: nW
+        ## 8. nW: Final weight updates.
         step_8 = half_rank + 1
         for i in range(step_8):
             self._weight_chunk()
