@@ -7,8 +7,21 @@ import torch.distributed as dist
 import dualpipe.comm as comm
 from dualpipe.utils import WeightGradStore, run_backward, scatter, gather
 
-
 class DualPipe(nn.Module):
+    '''
+    DualPipe optimizes performance through several innovative techniques:
+        Bidirectional Pipelining:
+            - Unlike traditional unidirectional pipelines, DualPipe processes data in both forward and reverse directions simultaneously across the pipeline ranks. For example, the first half of ranks process forward direction in phase 0 and reverse in phase 1, while the second half do the opposite. This keeps more GPUs active at once, reducing idle time.
+        Overlapped Computations:
+            - When modules support overlapped_forward_backward, the _forward_backward_compute_chunk method computes forward and backward passes concurrently. This leverages GPU parallelism, reducing the total time by overlapping operations that would otherwise be sequential.
+        Efficient Scheduling:
+            - The step method uses an 8-step schedule (nF0, nF0F1, nB1W1F1, nF0B1F1B0, nB1F1B0, nB1B0, nWB0, nW) that interleaves forward, backward, and weight update tasks. This minimizes dependencies and maximizes resource utilization, as seen in the main step (nF0B1F1B0), where all four operations overlap.
+        Asynchronous Communication:
+            - Communication operations (_recv_forward, _send_forward, _recv_backward, _send_backward) use PyTorch’s asynchronous irecv and isend. The _commit_and_wait_comm method batches these operations, allowing computation to proceed while communication occurs in the background, reducing blocking time.
+        Zero-Bubble Optimization:
+            - In steps like nB1W1F1, nB1B0, and nWB0, the enable_zb flag activates zero-bubble techniques via WeightGradStore. This delays gradient application until optimal points in the schedule, aligning computation and communication to eliminate idle periods.
+    These combined strategies result in a highly efficient pipeline that maximizes GPU utilization and minimizes latency.
+    '''
     def __init__(
         self,
         modules: Tuple[nn.Module, nn.Module],
@@ -434,6 +447,33 @@ class DualPipe(nn.Module):
             6. nB1B0: Backward for both phases, with zero-bubble for the second half.
             7. nWB0: Weight updates and backward for phase 0 with zero-bubble.
             8. nW: Final weight updates.
+
+
+            n:
+                the number of times a particular operation or sequence of operations is repeated in the pipeline schedule. 
+                For example, in nF0, "n" indicates that the forward operation in phase 0 (F0) is performed "n" times. 
+                It’s a multiplier for the operations that follow it.
+            F0: 
+                the forward pass in phase 0. In bidirectional pipelining, phase 0 typically refers to 
+                one direction of data flow—often the forward direction for the first half of the pipeline ranks 
+                (e.g., processing units like GPUs).
+            F1: 
+                the forward pass in phase 1. Phase 1 represents the opposite direction of data flow compared to 
+                phase 0—for example, the reverse direction for the first half of the ranks or the forward direction 
+                for the second half.
+            B0: 
+                the backward pass in phase 0. It corresponds to the backward pass (gradient computation) for the data flowing 
+                in the direction associated with phase 0.
+            B1: 
+                the backward pass in phase 1. It corresponds to the backward pass for the data flowing in the direction 
+                associated with phase 1.
+            W:
+                the weight update operation. It involves applying the gradients computed during the backward pass (B0 or B1) 
+                to update the model parameters. 
+            W1: 
+                a specific weight update related to phase 1. It likely occurs after the backward pass in phase 1 (B1), 
+                as seen in nB1W1F1. It could represent a targeted or partial weight update tied to phase 1’s computations.
+
         '''
 
         assert comm.TENSOR_SHAPES is not None and comm.TENSOR_DTYPE is not None, \
